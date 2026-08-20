@@ -2,6 +2,10 @@ import csv
 import sqlite3
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import pandas as pd
 from scipy import stats
@@ -17,16 +21,20 @@ FREQUENCY_OUTPUT = OUTPUT_DIR / "cell_frequencies.csv"
 SUBJECT_FREQUENCY_OUTPUT = OUTPUT_DIR / "subject_level_frequencies.csv"
 STATISTICS_OUTPUT = OUTPUT_DIR / "statistical_results.csv"
 
+BASELINE_OUTPUT = OUTPUT_DIR / "baseline_melanoma_pbmc.csv"
+PROJECT_COUNTS_OUTPUT = OUTPUT_DIR / "part4_project_counts.csv"
+RESPONSE_COUNTS_OUTPUT = OUTPUT_DIR / "part4_response_counts.csv"
+SEX_COUNTS_OUTPUT = OUTPUT_DIR / "part4_sex_counts.csv"
+
+FORM_ANSWER_OUTPUT = OUTPUT_DIR / "form_answer.txt"
+
 
 # -------------------------------------------------------------------
 # Part 2
 # -------------------------------------------------------------------
 
 def calculate_cell_frequencies():
-    """
-    Calculate the relative frequency of each immune-cell population
-    for every sample using the SQLite database.
-    """
+    """Calculate immune-cell frequency for every sample."""
 
     if not DB_PATH.exists():
         raise FileNotFoundError(
@@ -44,10 +52,7 @@ def calculate_cell_frequencies():
             totals.total_count,
             cc.cell_type AS population,
             cc.cell_count AS count,
-            ROUND(
-                100.0 * cc.cell_count / totals.total_count,
-                4
-            ) AS percentage
+            100.0 * cc.cell_count / totals.total_count AS percentage
         FROM cell_counts AS cc
         JOIN (
             SELECT
@@ -70,6 +75,7 @@ def calculate_cell_frequencies():
         newline="",
         encoding="utf-8",
     ) as output_file:
+
         writer = csv.writer(output_file)
 
         writer.writerow(
@@ -89,7 +95,7 @@ def calculate_cell_frequencies():
                     row["total_count"],
                     row["population"],
                     row["count"],
-                    row["percentage"],
+                    round(row["percentage"], 4),
                 ]
             )
 
@@ -100,48 +106,41 @@ def calculate_cell_frequencies():
 
 
 # -------------------------------------------------------------------
-# Part 3 helpers
+# Statistical helpers
 # -------------------------------------------------------------------
 
 def benjamini_hochberg(p_values):
-    """
-    Apply the Benjamini-Hochberg procedure to control
-    the false discovery rate across multiple hypothesis tests.
-    """
+    """Apply Benjamini-Hochberg FDR correction."""
 
     p_values = list(p_values)
     number_of_tests = len(p_values)
 
-    indexed = sorted(
+    ordered = sorted(
         enumerate(p_values),
         key=lambda item: item[1],
     )
 
     adjusted = [0.0] * number_of_tests
-    previous = 1.0
+    running_minimum = 1.0
 
-    for rank_from_end, (original_index, p_value) in enumerate(
-        reversed(indexed),
-        start=1,
-    ):
-        rank = number_of_tests - rank_from_end + 1
+    for rank in range(number_of_tests, 0, -1):
+
+        original_index, p_value = ordered[rank - 1]
 
         corrected = min(
-            previous,
+            running_minimum,
             p_value * number_of_tests / rank,
             1.0,
         )
 
         adjusted[original_index] = corrected
-        previous = corrected
+        running_minimum = corrected
 
     return adjusted
 
 
 def cohens_d(group_a, group_b):
-    """
-    Calculate Cohen's d using the pooled standard deviation.
-    """
+    """Calculate Cohen's d effect size."""
 
     n_a = len(group_a)
     n_b = len(group_b)
@@ -170,19 +169,12 @@ def cohens_d(group_a, group_b):
 
 def analyze_responder_differences():
     """
-    Compare immune-cell frequencies between responders and
-    non-responders among melanoma subjects treated with miraclib
-    using PBMC samples.
+    Compare cell frequencies between responders and non-responders
+    among melanoma subjects treated with miraclib using PBMC samples.
 
-    Because subjects have repeated longitudinal samples, samples
-    are first aggregated to one mean frequency per subject and
-    population before statistical testing.
+    Repeated samples are aggregated to the subject level before
+    hypothesis testing.
     """
-
-    if not DB_PATH.exists():
-        raise FileNotFoundError(
-            "Database not found. Run 'python load_data.py' first."
-        )
 
     OUTPUT_DIR.mkdir(exist_ok=True)
     FIGURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -195,7 +187,8 @@ def analyze_responder_differences():
             s.response,
             sm.sample_id,
             cc.cell_type,
-            100.0 * cc.cell_count / totals.total_count AS percentage
+            100.0 * cc.cell_count /
+                totals.total_count AS percentage
         FROM subjects AS s
         JOIN samples AS sm
             ON s.subject_id = sm.subject_id
@@ -232,7 +225,6 @@ def analyze_responder_differences():
             "No samples matched the Part 3 filters."
         )
 
-    # Normalize response labels.
     sample_level["response"] = (
         sample_level["response"]
         .str.lower()
@@ -244,9 +236,6 @@ def analyze_responder_differences():
         )
     )
 
-    # Each subject has longitudinal observations.
-    # Average those observations before statistical testing so
-    # the independent unit is the subject rather than the sample.
     subject_level = (
         sample_level
         .groupby(
@@ -267,11 +256,9 @@ def analyze_responder_differences():
 
     results = []
 
-    cell_types = sorted(
+    for cell_type in sorted(
         subject_level["cell_type"].unique()
-    )
-
-    for cell_type in cell_types:
+    ):
 
         population_data = subject_level[
             subject_level["cell_type"] == cell_type
@@ -287,17 +274,11 @@ def analyze_responder_differences():
             "percentage",
         ]
 
-        # Welch's t-test does not assume equal group variances.
         test = stats.ttest_ind(
             responders,
             non_responders,
             equal_var=False,
             nan_policy="omit",
-        )
-
-        effect_size = cohens_d(
-            responders,
-            non_responders,
         )
 
         results.append(
@@ -313,12 +294,16 @@ def analyze_responder_differences():
                 ),
                 "t_statistic": test.statistic,
                 "p_value": test.pvalue,
-                "cohens_d": effect_size,
+                "cohens_d": cohens_d(
+                    responders,
+                    non_responders,
+                ),
             }
         )
 
-        # Create one boxplot per immune-cell population.
-        figure, axis = plt.subplots(figsize=(6, 5))
+        figure, axis = plt.subplots(
+            figsize=(6, 5)
+        )
 
         axis.boxplot(
             [
@@ -331,23 +316,24 @@ def analyze_responder_differences():
             ],
         )
 
-        display_name = cell_type.replace("_", " ").title()
-
         axis.set_title(
-            f"{display_name}: Responders vs Non-responders"
+            f"{cell_type.replace('_', ' ').title()}: "
+            "Responders vs Non-responders"
         )
-        axis.set_ylabel("Cell frequency (%)")
-        axis.set_xlabel("Clinical response")
+
+        axis.set_xlabel(
+            "Clinical response"
+        )
+
+        axis.set_ylabel(
+            "Mean cell frequency per subject (%)"
+        )
 
         figure.tight_layout()
 
-        figure_path = (
-            FIGURE_DIR
-            / f"{cell_type}_response_boxplot.png"
-        )
-
         figure.savefig(
-            figure_path,
+            FIGURE_DIR
+            / f"{cell_type}_response_boxplot.png",
             dpi=300,
         )
 
@@ -355,10 +341,9 @@ def analyze_responder_differences():
 
     results_df = pd.DataFrame(results)
 
-    # Correct the five simultaneous hypothesis tests.
     results_df["adjusted_p_value"] = (
         benjamini_hochberg(
-            results_df["p_value"].tolist()
+            results_df["p_value"]
         )
     )
 
@@ -387,8 +372,12 @@ def analyze_responder_differences():
         index=False,
     )
 
-    print("\nPart 3: Responder vs non-responder analysis")
-    print("-------------------------------------------")
+    print(
+        "\nPart 3: Responder vs non-responder analysis"
+    )
+    print(
+        "-------------------------------------------"
+    )
 
     print(
         f"Samples matching filters: "
@@ -403,17 +392,9 @@ def analyze_responder_differences():
     print("\nStatistical results:")
 
     print(
-        results_df[
-            [
-                "population",
-                "responder_mean_pct",
-                "non_responder_mean_pct",
-                "p_value",
-                "adjusted_p_value",
-                "cohens_d",
-                "significant_fdr_0_05",
-            ]
-        ].to_string(index=False)
+        results_df.to_string(
+            index=False
+        )
     )
 
     print(
@@ -428,14 +409,216 @@ def analyze_responder_differences():
 
 
 # -------------------------------------------------------------------
-# Pipeline
+# Part 4
 # -------------------------------------------------------------------
 
+def analyze_baseline_samples():
+    """
+    Analyze baseline melanoma PBMC samples from subjects
+    treated with miraclib.
+    """
+
+    connection = sqlite3.connect(DB_PATH)
+
+    query = """
+        SELECT
+            s.project_id AS project,
+            s.subject_id,
+            s.response,
+            s.sex,
+            sm.sample_id,
+            sm.sample_type,
+            sm.time_from_treatment_start
+        FROM subjects AS s
+        JOIN samples AS sm
+            ON s.subject_id = sm.subject_id
+        WHERE
+            LOWER(s.condition) = 'melanoma'
+            AND LOWER(s.treatment) = 'miraclib'
+            AND LOWER(sm.sample_type) = 'pbmc'
+            AND sm.time_from_treatment_start = 0
+        ORDER BY
+            s.project_id,
+            s.subject_id;
+    """
+
+    baseline = pd.read_sql_query(
+        query,
+        connection,
+    )
+
+    connection.close()
+
+    if baseline.empty:
+        raise RuntimeError(
+            "No baseline samples matched Part 4 filters."
+        )
+
+    baseline.to_csv(
+        BASELINE_OUTPUT,
+        index=False,
+    )
+
+    project_counts = (
+        baseline
+        .groupby("project")
+        .size()
+        .rename("sample_count")
+        .reset_index()
+    )
+
+    response_counts = (
+        baseline[
+            ["subject_id", "response"]
+        ]
+        .drop_duplicates()
+        .groupby("response")
+        .size()
+        .rename("subject_count")
+        .reset_index()
+    )
+
+    sex_counts = (
+        baseline[
+            ["subject_id", "sex"]
+        ]
+        .drop_duplicates()
+        .groupby("sex")
+        .size()
+        .rename("subject_count")
+        .reset_index()
+    )
+
+    project_counts.to_csv(
+        PROJECT_COUNTS_OUTPUT,
+        index=False,
+    )
+
+    response_counts.to_csv(
+        RESPONSE_COUNTS_OUTPUT,
+        index=False,
+    )
+
+    sex_counts.to_csv(
+        SEX_COUNTS_OUTPUT,
+        index=False,
+    )
+
+    print(
+        "\nPart 4: Baseline melanoma PBMC summary"
+    )
+    print(
+        "--------------------------------------"
+    )
+
+    print(
+        f"Baseline samples: "
+        f"{baseline['sample_id'].nunique():,}"
+    )
+
+    print(
+        f"Unique subjects: "
+        f"{baseline['subject_id'].nunique():,}"
+    )
+
+    print("\nSamples by project:")
+    print(
+        project_counts.to_string(
+            index=False
+        )
+    )
+
+    print("\nSubjects by response:")
+    print(
+        response_counts.to_string(
+            index=False
+        )
+    )
+
+    print("\nSubjects by sex:")
+    print(
+        sex_counts.to_string(
+            index=False
+        )
+    )
+
+
+# -------------------------------------------------------------------
+# Form calculation
+# -------------------------------------------------------------------
+
+def calculate_form_answer():
+    """
+    Average B-cell count for melanoma male responders at
+    time zero across all treatments and sample types.
+    """
+
+    connection = sqlite3.connect(DB_PATH)
+
+    query = """
+        SELECT
+            AVG(cc.cell_count) AS average_b_cells,
+            COUNT(*) AS sample_count
+        FROM subjects AS s
+        JOIN samples AS sm
+            ON s.subject_id = sm.subject_id
+        JOIN cell_counts AS cc
+            ON sm.sample_id = cc.sample_id
+        WHERE
+            LOWER(s.condition) = 'melanoma'
+            AND LOWER(s.sex) = 'm'
+            AND LOWER(s.response) = 'yes'
+            AND sm.time_from_treatment_start = 0
+            AND cc.cell_type = 'b_cell';
+    """
+
+    result = connection.execute(
+        query
+    ).fetchone()
+
+    connection.close()
+
+    if result is None or result[0] is None:
+        raise RuntimeError(
+            "Unable to calculate form answer."
+        )
+
+    average_b_cells = result[0]
+    sample_count = result[1]
+
+    FORM_ANSWER_OUTPUT.write_text(
+        f"{average_b_cells:.2f}\n",
+        encoding="utf-8",
+    )
+
+    print(
+        "\nGoogle Form calculation"
+    )
+    print(
+        "-----------------------"
+    )
+
+    print(
+        f"Matching baseline samples: "
+        f"{sample_count:,}"
+    )
+
+    print(
+        f"Average B-cell count: "
+        f"{average_b_cells:.2f}"
+    )
+
+    print(
+        f"Answer saved to: "
+        f"{FORM_ANSWER_OUTPUT}"
+    )
+
+
 def main():
-
     calculate_cell_frequencies()
-
     analyze_responder_differences()
+    analyze_baseline_samples()
+    calculate_form_answer()
 
 
 if __name__ == "__main__":
